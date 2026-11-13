@@ -1,0 +1,7 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: network-qos, namespace: network-qos}
+spec:
+  selector:
+    matchExpressions: [{key: app, operator: In, values: [network-qos-agent, network-qos-controller]}]
+  podMetricsEndpoints: [{port: metrics, interval: 60s}]

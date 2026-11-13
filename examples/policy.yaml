@@ -1,0 +1,89 @@
+# An example NetworkQosPolicy for a site with one VyOS router (WAN eth0,
+# LAN eth2), Linux Kubernetes nodes on the router's LAN and managed QNAP
+# switches. Addresses are documentation ranges (RFC 5737, RFC 3849): LAN
+# 192.0.2.0/24, pods 198.51.100.0/24, services 203.0.113.0/24.
+apiVersion: network.appmana.com/v1alpha1
+kind: NetworkQosPolicy
+metadata:
+  name: site
+spec:
+  classes:
+    - name: network-control
+      dscp: CS6
+      rank: 0
+      node: {guaranteePercent: 2, queue: fq_codel}
+      switch: {queue: 7}
+      match:
+        ports:
+          - {protocol: tcp, port: 179}
+          - {protocol: tcp, port: 2379}
+          - {protocol: tcp, port: 2380}
+    - name: rdma
+      dscp: AF31
+      rank: 1
+      node: {guaranteePercent: 66, queue: pfifo}
+      switch: {queue: 7}
+      match:
+        ports:
+          - {protocol: udp, port: 4791}
+    - name: realtime
+      dscp: EF
+      rank: 2
+      node: {guaranteePercent: 4, queue: fq_codel}
+      switch: {queue: 6}
+      router: {markSources: true}
+      match:
+        services:
+          - {namespace: media, name: turn}
+        pods:
+          - podSelector:
+              matchLabels: {network.appmana.com/class: realtime}
+    - name: web
+      dscp: AF41
+      rank: 3
+      node: {guaranteePercent: 4, queue: fq_codel}
+      switch: {queue: 5}
+      router: {markSources: true}
+      match:
+        services:
+          - {namespace: ingress, name: ingress-controller}
+    - name: storage
+      dscp: AF21
+      rank: 4
+      node: {guaranteePercent: 18, queue: fq_codel}
+      switch: {queue: 3}
+      match:
+        pods:
+          - namespaceSelector:
+              matchLabels: {kubernetes.io/metadata.name: storage}
+            podSelector:
+              matchLabels: {app.kubernetes.io/component: volume}
+        cidrs: [192.0.2.73/32]
+  router:
+    mode: Observe
+    endpoint: https://192.0.2.1:9090
+    credentialsSecretRef: {namespace: network-qos, name: vyos-api, key: API_KEY}
+    commitConfirmMinutes: 1
+    lanInterface: eth2
+    downloadRate: 900mbit
+    wan:
+      - {interface: eth0, uploadRate: 900mbit}
+    trustedSources:
+      cidrs: [198.51.100.0/24, 203.0.113.0/24, 2001:db8:ffff::/108]
+      podIPv6Pools: true
+  nodes:
+    mode: Observe
+    enforceNodeSelector:
+      matchExpressions:
+        - {key: kubernetes.io/hostname, operator: In, values: []}
+    rootPercent: 97
+    minDefaultPercent: 5
+    lanGateway: 192.0.2.1
+    podInterfacePrefix: cali
+  switches:
+    enabled: false
+    disabledReason: no switch credentials in this example
+    credentialsSecretRef: {namespace: network-qos, name: switch-credentials, key: password}
+    defaultQueue: 0
+    devices:
+      - {name: switch-a, address: 192.0.2.23}

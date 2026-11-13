@@ -1,0 +1,148 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: networkqospolicies.network.appmana.com
+spec:
+  group: network.appmana.com
+  scope: Cluster
+  names: {kind: NetworkQosPolicy, plural: networkqospolicies, singular: networkqospolicy, shortNames: [nqos]}
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources: {status: {}}
+      additionalPrinterColumns:
+        - {name: Router, type: string, jsonPath: .status.router.phase}
+        - {name: Nodes, type: string, jsonPath: .status.agents.summary}
+        - {name: Switches, type: string, jsonPath: .status.switches.phase}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [classes, router, nodes]
+              properties:
+                classes:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, dscp, rank]
+                    properties:
+                      name: {type: string, pattern: '^[a-z][a-z0-9-]{0,30}$'}
+                      dscp:
+                        description: DSCP name (EF, AF41, CS6, ...) or number 1-63.
+                        x-kubernetes-int-or-string: true
+                      rank: {type: integer, minimum: 0, description: Priority; 0 is highest; unique.}
+                      node:
+                        type: object
+                        properties:
+                          guaranteePercent: {type: integer, minimum: 0, maximum: 90}
+                          queue: {type: string, enum: [fq_codel, pfifo]}
+                      router:
+                        type: object
+                        properties:
+                          markSources: {type: boolean, description: "Mark LAN-ingress packets from the matched Services' VIPs (replies of DNAT'd inbound flows)."}
+                      switch:
+                        type: object
+                        properties:
+                          queue: {type: integer, minimum: 0, maximum: 7}
+                      match:
+                        type: object
+                        properties:
+                          pods:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                namespaceSelector: &selector
+                                  description: metav1.LabelSelector
+                                  type: object
+                                  properties:
+                                    matchLabels: {type: object, additionalProperties: {type: string}}
+                                    matchExpressions:
+                                      type: array
+                                      items:
+                                        type: object
+                                        required: [key, operator]
+                                        properties:
+                                          key: {type: string}
+                                          operator: {type: string, enum: [In, NotIn, Exists, DoesNotExist]}
+                                          values: {type: array, items: {type: string}}
+                                podSelector: *selector
+                          services:
+                            type: array
+                            items:
+                              type: object
+                              required: [namespace, name]
+                              properties:
+                                namespace: {type: string}
+                                name: {type: string}
+                          cidrs: {type: array, items: {type: string}}
+                          ports:
+                            description: IANA-registered protocol ports only (RoCEv2 4791, BGP 179, etcd 2379/2380).
+                            type: array
+                            items:
+                              type: object
+                              required: [protocol, port]
+                              properties:
+                                protocol: {type: string, enum: [tcp, udp]}
+                                port: {type: integer, minimum: 1, maximum: 65535}
+                router:
+                  type: object
+                  required: [endpoint, credentialsSecretRef, lanInterface, downloadRate, wan]
+                  properties:
+                    mode: {type: string, enum: [Observe, Enforce]}
+                    endpoint: {type: string}
+                    credentialsSecretRef: &secretRef
+                      type: object
+                      required: [namespace, name, key]
+                      properties:
+                        namespace: {type: string}
+                        name: {type: string}
+                        key: {type: string}
+                    commitConfirmMinutes: {type: integer, minimum: 1, maximum: 10}
+                    lanInterface: {type: string}
+                    downloadRate: {type: string, pattern: '^[0-9]+(kbit|mbit|gbit)$', description: CAKE rate on the LAN interface's egress (downloads).}
+                    wan:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: object
+                        required: [interface, uploadRate]
+                        properties:
+                          interface: {type: string, pattern: '^(eth|wlan)[0-9]+$'}
+                          uploadRate: {type: string, pattern: '^[0-9]+(kbit|mbit|gbit)$'}
+                    trustedSources:
+                      type: object
+                      properties:
+                        cidrs: {type: array, items: {type: string}}
+                        podIPv6Pools: {type: boolean}
+                nodes:
+                  type: object
+                  properties:
+                    mode: {type: string, enum: [Observe, Mark, Enforce]}
+                    enforceNodeSelector: *selector
+                    rootPercent: {type: integer, minimum: 50, maximum: 99}
+                    minDefaultPercent: {type: integer, minimum: 1, maximum: 50}
+                    lanGateway: {type: string}
+                    podInterfacePrefix: {type: string}
+                switches:
+                  type: object
+                  properties:
+                    enabled: {type: boolean}
+                    mode: {type: string, enum: [Observe, Enforce]}
+                    disabledReason: {type: string}
+                    credentialsSecretRef: *secretRef
+                    defaultQueue: {type: integer, minimum: 0, maximum: 7}
+                    devices:
+                      type: array
+                      items:
+                        type: object
+                        required: [name, address]
+                        properties:
+                          name: {type: string}
+                          address: {type: string}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

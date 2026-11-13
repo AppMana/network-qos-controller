@@ -1,0 +1,171 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: network-qos
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: network-qos-controller, namespace: network-qos}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: network-qos-controller}
+rules:
+  - apiGroups: [network.appmana.com]
+    resources: [networkqospolicies]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [network.appmana.com]
+    resources: [networkqospolicies/status]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [nodes, namespaces, pods, services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [crd.projectcalico.org]
+    resources: [ippools]
+    verbs: [get, list]
+  # kopf discovers the resource it serves.
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: network-qos-controller}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: network-qos-controller}
+subjects: [{kind: ServiceAccount, name: network-qos-controller, namespace: network-qos}]
+---
+# The rendered node config and the switch credentials live here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: network-qos-controller, namespace: network-qos}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    # The router API key and switch credentials the policy names.
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: network-qos-controller, namespace: network-qos}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: network-qos-controller}
+subjects: [{kind: ServiceAccount, name: network-qos-controller, namespace: network-qos}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: network-qos-controller, namespace: network-qos}
+spec:
+  replicas: 1
+  # One writer to the router at a time: never two controller pods.
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: network-qos-controller}}
+  template:
+    metadata: {labels: {app: network-qos-controller}}
+    spec:
+      serviceAccountName: network-qos-controller
+      nodeSelector: {kubernetes.io/os: linux}
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534}
+      containers:
+        - name: controller
+          image: ghcr.io/appmana/network-qos-controller:v0.1.0
+          command: [kopf, run, --all-namespaces, --liveness=http://0.0.0.0:8080/healthz, -m, network_qos.controller]
+          env:
+            - {name: NAMESPACE, value: network-qos}
+          ports: [{name: metrics, containerPort: 9818}]
+          livenessProbe: {httpGet: {path: /healthz, port: 8080}, initialDelaySeconds: 60, periodSeconds: 30}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources:
+            requests: {cpu: 20m, memory: 128Mi}
+            limits: {memory: 384Mi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: network-qos-agent, namespace: network-qos}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: network-qos-agent}
+rules:
+  # Its own Node, for the lan-mbit override annotation.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: network-qos-agent}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: network-qos-agent}
+subjects: [{kind: ServiceAccount, name: network-qos-agent, namespace: network-qos}]
+---
+# The agent's only configuration input.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: network-qos-agent, namespace: network-qos}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [network-qos-node-config]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: network-qos-agent, namespace: network-qos}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: network-qos-agent}
+subjects: [{kind: ServiceAccount, name: network-qos-agent, namespace: network-qos}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: network-qos-agent, namespace: network-qos}
+spec:
+  selector: {matchLabels: {app: network-qos-agent}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata: {labels: {app: network-qos-agent}}
+    spec:
+      serviceAccountName: network-qos-agent
+      # The node's own network namespace: the tables and qdiscs it programs
+      # are the node's.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {kubernetes.io/os: linux}
+      tolerations: [{operator: Exists}]
+      priorityClassName: system-node-critical
+      containers:
+        - name: agent
+          image: ghcr.io/appmana/network-qos-controller:v0.1.0
+          command: [python, -m, network_qos.agent]
+          env:
+            - {name: NAMESPACE, value: network-qos}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: metrics, containerPort: 9817, hostPort: 9817}]
+          securityContext:
+            # NET_ADMIN is the only capability: nftables (table inet
+            # appmana_qos) and tc (the LAN interface's root qdisc) both go
+            # through netlink calls that require it. Root uid is needed for
+            # the capability to be effective; nothing else is granted.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL], add: [NET_ADMIN]}
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {memory: 192Mi}
+          volumeMounts:
+            # tmpfs on the host: the applied-tree hash lives exactly as long
+            # as the qdisc, so agent restarts never swap a live qdisc.
+            - {name: run, mountPath: /run/appmana-qos}
+      volumes:
+        - {name: run, hostPath: {path: /run/appmana-qos, type: DirectoryOrCreate}}
